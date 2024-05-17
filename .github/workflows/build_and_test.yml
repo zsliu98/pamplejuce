@@ -222,7 +222,7 @@ jobs:
           mv "packaging/Output/${{ env.ARTIFACT_NAME }}.exe" "${{ env.ARTIFACTS_PATH }}/"
 
       - name: Codesign with Azure Trusted Signing (Windows)
-        if: ${{ matrix.name == 'Windows' }}
+        if: ${{ (matrix.name == 'Windows') && (env.AZURE_AVAILABLE_ID != '') }}
         uses: azure/trusted-signing-action@v0.3.16
         with:
           # The Azure Active Directory tenant (directory) ID.
@@ -247,6 +247,8 @@ jobs:
           files-folder: ${{ env.ARTIFACTS_PATH }}
           files-folder-filter: exe
           file-digest: SHA256
+        env:
+          AZURE_AVAILABLE_ID: ${{ secrets.AZURE_TENANT_ID }}
 
       - name: Upload Exe (Windows)
         if: ${{ matrix.name == 'Windows' }}
