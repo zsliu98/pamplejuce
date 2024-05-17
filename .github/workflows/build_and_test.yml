@@ -107,10 +107,12 @@ jobs:
 
       - name: Import Certificates (macOS)
         uses: apple-actions/import-codesign-certs@v2 # only exists as a tag right now
-        if: ${{ matrix.name == 'macOS' }}
+        if: ${{ (matrix.name == 'macOS') && (env.p12-file-base64 != '')}}
         with:
           p12-file-base64: ${{ secrets.DEV_ID_APP_CERT }}
           p12-password: ${{ secrets.DEV_ID_APP_PASSWORD }}
+        env:
+          p12-file-base64: ${{ secrets.DEV_ID_APP_CERT }}
 
       - name: Configure
         shell: bash
@@ -149,65 +151,77 @@ jobs:
           ${{ matrix.pluginval-binary }} --strictness-level 10 --verbose --validate "${{ env.VST3_PATH }}"
 
       - name: Codesign (macOS)
-        if: ${{ matrix.name == 'macOS' }}
+        if: ${{ matrix.name == 'macOS' &&  (env.DEVELOPER_ID_APPLICATION != '')}}
         run: |
           # Each plugin must be code signed
           codesign --force -s "${{ secrets.DEVELOPER_ID_APPLICATION}}" -v "${{ env.VST3_PATH }}" --deep --strict --options=runtime --timestamp
           codesign --force -s "${{ secrets.DEVELOPER_ID_APPLICATION}}" -v "${{ env.AU_PATH }}" --deep --strict --options=runtime --timestamp
           codesign --force -s "${{ secrets.DEVELOPER_ID_APPLICATION}}" -v "${{ env.STANDALONE_PATH }}" --deep --strict --options=runtime --timestamp
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION}}
 
-      - name: Add Custom Icons (macOS)
+      - name: Generate Packages (macOS)
         if: ${{ matrix.name == 'macOS' }}
         run: |
-          # add the icns as its own icon resource (meta!)
-          sips -i packaging/pamplejuce.icns
+          pkgbuild --identifier "${{ env.BUNDLE_ID }}.au.pkg" --version $VERSION --component "${{ env.AU_PATH }}" --install-location "/Library/Audio/Plug-Ins/Components" "${{ env.BUILD_DIR }}/${{ env.PRODUCT_NAME }}.au.pkg"
+          pkgbuild --identifier "${{ env.BUNDLE_ID }}.vst3.pkg" --version $VERSION --component "${{ env.VST3_PATH }}" --install-location "/Library/Audio/Plug-Ins/VST3" "${{ env.BUILD_DIR }}/${{ env.PRODUCT_NAME }}.vst3.pkg"
+          python3 -u packaging/generator.py
 
-          # Grab the resource, put in tempfile
-          DeRez -only icns packaging/pamplejuce.icns > /tmp/icons
+      - name: Sign Final Package (macOS)
+        if: ${{ (matrix.name == 'macOS') && (env.APPLE_INSTALLER_DEV != '') }}
+        run: productsign --sign "${{ secrets.APPLE_INSTALLER_DEV }}" "${{ env.ARTIFACT_NAME }}_unsigned.pkg" "${{ env.ARTIFACT_NAME }}.pkg"
+        env:
+          APPLE_INSTALLER_DEV: ${{ secrets.APPLE_INSTALLER_DEV }}
 
-          # Stuff the resource into the strange Icon? file's resource fork
-          Rez -a /tmp/icons -o "${{ env.VST3_PATH }}/Icon"$'\r'
-          Rez -a /tmp/icons -o "${{ env.AU_PATH }}/Icon"$'\r'
+      - name: Rename Final Package (macOS)
+        if: ${{ (matrix.name == 'macOS') && (env.APPLE_INSTALLER_DEV == '') }}
+        run: mv "${{ env.ARTIFACT_NAME }}_unsigned.pkg" "${{ env.ARTIFACT_NAME }}.pkg"
+        env:
+          APPLE_INSTALLER_DEV: ${{ secrets.APPLE_INSTALLER_DEV }}
 
-          # Set custom icon attribute
-          SetFile -a C "${{ env.VST3_PATH }}"
-          SetFile -a C "${{ env.AU_PATH }}"
+      - name: Notarize and Staple PKG (macOS)
+        if: ${{ (matrix.name == 'macOS') && (env.NOTARIZATION_USERNAME != '') }}
+        run: |
+          xcrun notarytool submit "${{ env.ARTIFACT_NAME }}.pkg" --apple-id ${{ secrets.NOTARIZATION_USERNAME }} --password ${{ secrets.NOTARIZATION_PASSWORD }} --team-id ${{ secrets.TEAM_ID }} --wait
+          xcrun stapler staple "${{ env.ARTIFACT_NAME }}.pkg"
+        env:
+          NOTARIZATION_USERNAME: ${{ secrets.NOTARIZATION_USERNAME }}
 
-      - name: Create DMG, Notarize and Staple (macOS)
+      - name: Create DMG (macOS)
         if: ${{ matrix.name == 'macOS' }}
         run: |
-          # workaround for https://github.com/LinusU/node-appdmg/issues/234
-          python3 -m pip install setuptools --break-system-packages
-          npm install -g appdmg
-          mkdir -p packaging/dmg
+          mkdir "${{ env.ARTIFACTS_PATH }}/dmgtmp"
+          mv "${{ env.ARTIFACT_NAME }}.pkg" "${{ env.ARTIFACTS_PATH }}/dmgtmp"
+          hdiutil create "${{ env.ARTIFACTS_PATH }}/tmp.dmg" -ov -volname "${{ env.ARTIFACT_NAME }}" -fs HFS+ -srcfolder "${{ env.ARTIFACTS_PATH }}/dmgtmp"
+          hdiutil convert "${{ env.ARTIFACTS_PATH }}/tmp.dmg" -format UDZO -o "${{ env.ARTIFACT_NAME }}.dmg"
 
-          # Create directories for the dmg symlinks
-          sudo mkdir -m 755 -p /Library/Audio/Plug-Ins/Components && sudo mkdir -m 755 -p /Library/Audio/Plug-Ins/VST3
-          ln -s /Library/Audio/Plug-Ins/Components "packaging/dmg/Your Mac's Component folder"
-          ln -s /Library/Audio/Plug-Ins/VST3 "packaging/dmg/Your Mac's VST3 folder"
-          mv "${{ env.VST3_PATH }}" packaging/dmg
-          mv "${{ env.AU_PATH }}" packaging/dmg
-          mv "${{ env.STANDALONE_PATH }}" packaging/dmg
+      - name: Upload DMG (macOS)
+        if: ${{ matrix.name == 'macOS' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}.dmg
+          path: "${{ env.ARTIFACT_NAME }}.dmg"
 
-          # Run appdmg to create the .dmg
-          cd packaging && appdmg dmg.json "${{ env.ARTIFACT_NAME}}.dmg"
-          codesign -s "${{ secrets.DEVELOPER_ID_APPLICATION}}" --timestamp -i ${{ env.BUNDLE_ID }} --force "${{ env.ARTIFACT_NAME }}.dmg"
-          xcrun notarytool submit "${{ env.ARTIFACT_NAME }}.dmg" --apple-id ${{ secrets.NOTARIZATION_USERNAME }} --password ${{ secrets.NOTARIZATION_PASSWORD }} --team-id ${{ secrets.TEAM_ID }} --wait
-          xcrun stapler staple "${{ env.ARTIFACT_NAME }}.dmg"
-
-      - name: Zip
+      - name: Zip (Linux)
         if: ${{ matrix.name == 'Linux' }}
         working-directory: ${{ env.ARTIFACTS_PATH }}
         run: 7z a -tzip "${{ env.ARTIFACT_NAME }}.zip" "-xr!lib${{ env.PRODUCT_NAME }}_SharedCode.a" .
 
-      - name: Generate Installer
+      - name: Upload Zip (Linux)
+        if: ${{ matrix.name == 'Linux' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}.zip
+          path: "${{ env.ARTIFACTS_PATH }}/${{ env.ARTIFACT_NAME }}.zip"
+
+      - name: Generate Installer (Windows)
         if: ${{ matrix.name == 'Windows' }}
         shell: bash
         run: |
           iscc "packaging\installer.iss"
           mv "packaging/Output/${{ env.ARTIFACT_NAME }}.exe" "${{ env.ARTIFACTS_PATH }}/"
 
-      - name: Codesign with Azure Trusted Signing
+      - name: Codesign with Azure Trusted Signing (Windows)
         if: ${{ matrix.name == 'Windows' }}
         uses: azure/trusted-signing-action@v0.3.16
         with:
@@ -240,20 +254,6 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME }}.exe
           path: "${{ env.ARTIFACTS_PATH }}/${{ env.ARTIFACT_NAME }}.exe"
-
-      - name: Upload Zip (Linux)
-        if: ${{ matrix.name == 'Linux' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}.zip
-          path: "${{ env.ARTIFACTS_PATH }}/${{ env.ARTIFACT_NAME }}.zip"
-
-      - name: Upload DMG (macOS)
-        if: ${{ matrix.name == 'macOS' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}.dmg
-          path: packaging/${{ env.ARTIFACT_NAME }}.dmg
 
   release:
     if: contains(github.ref, 'tags/v')
